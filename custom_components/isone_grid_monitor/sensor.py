@@ -478,6 +478,8 @@ class ISONEForecastAlertsSensor(ISONEBaseSensor):
                 day_key = f"day_{idx}"
                 attrs[day_key] = {
                     "date": day.get("date"),
+                    "calendar_date": day.get("calendar_date"),
+                    "weekday": day.get("weekday"),
                     "days_ahead": day.get("days_ahead"),
                     "alert_count": day.get("alert_count"),
                     "alerts": [
@@ -490,3 +492,4 @@ class ISONEForecastAlertsSensor(ISONEBaseSensor):
                 }
         
         return attrs
+
