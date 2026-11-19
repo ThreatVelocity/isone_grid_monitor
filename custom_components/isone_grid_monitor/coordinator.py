@@ -428,71 +428,96 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                     if label and values:
                         data[label] = values
             
-            # Analyze for capacity issues
+            # Analyze using ISO-NE's own numbers (v1.0.9).
+            # The old logic compared Total Available Generation and Imports against the
+            # Capacity Supply Obligation (CSO). CSO is a capacity-market commitment, not
+            # demand, so it produced false "Critical" alerts. ISO publishes the real
+            # figures: Projected Surplus/(Deficiency) and Load Relief Actions Anticipated.
             alerts = []
-            
-            # Check capacity margins
-            if "Total Capacity Supply Obligation (CSO)" in data and "Total Available Generation and Imports" in data:
-                cso = data["Total Capacity Supply Obligation (CSO)"]
-                available = data["Total Available Generation and Imports"]
-                
-                for i, day in enumerate(days):
-                    if i < len(cso) and i < len(available):
-                        try:
-                            cso_val = float(cso[i].replace(',', ''))
-                            avail_val = float(available[i].replace(',', ''))
-                            margin = ((avail_val - cso_val) / cso_val * 100)
-                            
-                            if margin < 5:
-                                calendar_dt = datetime.now() + timedelta(days=i + 1)
-                                alerts.append({
-                                    "date": day,
-                                    "calendar_date": calendar_dt.strftime("%Y-%m-%d"),
-                                    "weekday": calendar_dt.strftime("%a"),
-                                    "days_ahead": i,
-                                    "alerts": [{
-                                        "type": "Critical Reserve Margin" if margin < 0 else "Low Reserve Margin",
-                                        "message": f"Reserve margin: {margin:.1f}% (Available: {avail_val:,.0f} MW, Required: {cso_val:,.0f} MW)",
-                                        "keyword": "capacity"
-                                    }],
-                                    "alert_count": 1
-                                })
-                        except (ValueError, IndexError):
-                            pass
-            
-            # Check for high cold weather outages
-            if "Anticipated Cold Weather Outages" in data:
-                outages = data["Anticipated Cold Weather Outages"]
-                for i, day in enumerate(days):
-                    if i < len(outages):
-                        try:
-                            outage_val = float(outages[i].replace(',', ''))
-                            if outage_val > 3000:
-                                day_alert = next((a for a in alerts if a["days_ahead"] == i), None)
-                                if day_alert:
-                                    day_alert["alerts"].append({
-                                        "type": "High Cold Weather Outages",
-                                        "message": f"{outage_val:,.0f} MW offline due to cold weather",
-                                        "keyword": "outage"
-                                    })
-                                    day_alert["alert_count"] += 1
-                                else:
-                                    calendar_dt = datetime.now() + timedelta(days=i + 1)
-                                    alerts.append({
-                                        "date": day,
-                                        "calendar_date": calendar_dt.strftime("%Y-%m-%d"),
-                                        "weekday": calendar_dt.strftime("%a"),
-                                        "days_ahead": i,
-                                        "alerts": [{
-                                            "type": "High Cold Weather Outages",
-                                            "message": f"{outage_val:,.0f} MW offline due to cold weather",
-                                            "keyword": "outage"
-                                        }],
-                                        "alert_count": 1
-                                    })
-                        except (ValueError, IndexError):
-                            pass
-            
+            LOW_SURPLUS_MW = 1000  # tune: surplus below this is flagged as tight
+            LOAD_RELIEF = {
+                "Power Warning": "Critical Load Relief Action",
+                "Cold Weather Event": "Critical Load Relief Action",
+                "Cold Weather Warning": "Critical Load Relief Action",
+                "Power Watch": "Load Relief Watch",
+                "Cold Weather Watch": "Load Relief Watch",
+            }
+
+            def _cell(label, i):
+                try:
+                    return str(data[label][i]).strip().strip('"').strip()
+                except (KeyError, IndexError):
+                    return ""
+
+            def _num(label, i):
+                try:
+                    return float(_cell(label, i).replace(',', ''))
+                except ValueError:
+                    return None
+
+            def _day_info(i):
+                try:
+                    dt = datetime.strptime(_cell("Date", i), "%m/%d/%Y")
+                except ValueError:
+                    dt = datetime.now() + timedelta(days=i + 1)
+                return dt.strftime("%Y-%m-%d"), dt.strftime("%a")
+
+            def _add(i, alert):
+                existing = next((a for a in alerts if a["days_ahead"] == i), None)
+                if existing:
+                    existing["alerts"].append(alert)
+                    existing["alert_count"] += 1
+                    return
+                cal_date, weekday = _day_info(i)
+                alerts.append({
+                    "date": days[i] if i < len(days) else "Day " + str(i + 2),
+                    "calendar_date": cal_date,
+                    "weekday": weekday,
+                    "days_ahead": i,
+                    "alerts": [alert],
+                    "alert_count": 1,
+                })
+
+            for i in range(len(days)):
+                # 1. ISO-NE's own Load Relief Actions flags
+                for label, alert_type in LOAD_RELIEF.items():
+                    if _cell(label, i).lower() not in ("", "-", "no", "n"):
+                        _add(i, {
+                            "type": alert_type,
+                            "message": label + " anticipated",
+                            "keyword": "load_relief",
+                        })
+
+                # 2. Projected surplus/deficiency (available vs. load + required reserve)
+                surplus = _num("Projected Surplus/(Deficiency)", i)
+                if surplus is not None:
+                    available = _num("Total Available Generation and Imports", i)
+                    need = _num("Total Load plus Required Reserve", i)
+                    detail = ""
+                    if available is not None and need is not None:
+                        detail = f" (Available: {available:,.0f} MW, Load + reserve: {need:,.0f} MW)"
+                    if surplus < 0:
+                        _add(i, {
+                            "type": "Critical Reserve Margin",
+                            "message": f"Projected deficiency: {abs(surplus):,.0f} MW{detail}",
+                            "keyword": "capacity",
+                        })
+                    elif surplus < LOW_SURPLUS_MW:
+                        _add(i, {
+                            "type": "Low Reserve Margin",
+                            "message": f"Projected surplus only {surplus:,.0f} MW{detail}",
+                            "keyword": "capacity",
+                        })
+
+                # 3. High cold weather outages (informational)
+                outage = _num("Anticipated Cold Weather Outages", i)
+                if outage is not None and outage > 3000:
+                    _add(i, {
+                        "type": "High Cold Weather Outages",
+                        "message": f"{outage:,.0f} MW offline due to cold weather",
+                        "keyword": "outage",
+                    })
+
             return {
                 "alerts": alerts,
                 "has_alerts": len(alerts) > 0,
